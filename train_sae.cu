@@ -115,7 +115,7 @@ __global__ void biasMultRelu(const float *mat, const float *vec, const float *bi
     }
 }
 
-__global__ void multBias(const float *mat, const float *vec, const float *bias, float *out, int rows, int cols) {
+__global__ void multBias(const floatX *mat, const floatX *vec, const floatX *bias, float *out, int rows, int cols) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < rows) {
         float sum = 0.0;
@@ -126,7 +126,7 @@ __global__ void multBias(const float *mat, const float *vec, const float *bias, 
     }
 }
 
-void forward(float *input, float *bias_1, float *bias_2, float *W_1, float *W_2, int W_1_m, int W_1_n, int W_2_m, int W_2_n) {
+void forward(floatX *input, floatX *bias_1, floatX *bias_2, floatX *W_1, floatX *W_2, int W_1_m, int W_1_n, int W_2_m, int W_2_n) {
     int threads = 256;
     int blocksW1m = (W_1_m + threads - 1) / threads; // should be 2
     int blocksW2m = (W_2_m + threads - 1) / threads;
