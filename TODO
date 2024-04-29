@@ -1,0 +1,8 @@
+- Training SAE -
+* implement backwards pass
+* perf test different kernels
+* explore cutting forward pass short in GPT
+
+- Feature Exploration -
+* serve over web server
+* pretty python example to explore
