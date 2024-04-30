@@ -83,6 +83,11 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
 }
 
 struct {
+size_t width = 512;
+size_t expansion_factor = 8; 
+} SAEConfig
+
+struct {
   SAEConfig config;
 
   ParameterTensors params;
@@ -103,6 +108,38 @@ struct {
 } SAE
 
 //TODO: custom SAE kernel fusing relu(A * B) * C
+
+__global__ void backwardMultBias(const float *mat, const float *vec, const float *d_out, float *d_mat, float *d_vec, float *d_bias, int rows, int cols) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < rows) {
+        // Since bias affects the output directly and independently per row:
+        atomicAdd(&d_bias[row], d_out[row]);
+
+        for (int col = 0; col < cols; ++col) {
+            int idx = row * cols + col;
+            float d_output = d_out[row];
+            // Propagate d_out to weights: Gradient w.r.t. the weight is input scaled by d_out
+            atomicAdd(&d_mat[idx], d_output * vec[col]);
+            // Propagate d_out to input features: Gradient w.r.t. the input is weights scaled by d_out
+            atomicAdd(&d_vec[col], d_output * mat[idx]);
+        }
+    }
+}
+
+__global__ void backwardBiasMultRelu(const float *mat, const float *vec, const float *bias, const float *d_out, float *d_mat, float *d_vec, float *d_bias, const float *out, int rows, int cols) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < rows) {
+        float d_input = 0.0;
+        for (int col = 0; col < cols; ++col) {
+            int idx = row * cols + col;
+            float grad_output = (out[row] > 0) ? d_out[row] : 0.0f; // ReLU derivative
+            atomicAdd(&d_mat[idx], grad_output * vec[col]);
+            atomicAdd(&d_vec[col], grad_output * mat[idx]);
+            atomicAdd(&d_bias[col], grad_output);
+        }
+    }
+}
+
 
 __global__ void biasMultRelu(const float *mat, const float *vec, const float *bias, float *out, int rows, int cols) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
