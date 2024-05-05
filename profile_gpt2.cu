@@ -2,7 +2,7 @@
 This code is a convenience tool for profiling the CUDA kernels in the training
 loop of train_gpt2.cu. Compile:
 
-make profile_gpt2.cu
+make profile_gpt2cu NO_MULTI_GPU=1
 
 And then e.g. use ncu from NVIDIA. The CLI docs for example:
 https://docs.nvidia.com/nsight-compute/NsightComputeCli/
@@ -34,6 +34,7 @@ int main() {
     cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
+    cuda_num_SMs = deviceProp.multiProcessorCount;
     printf("[System]\n");
     printf("Device %d: %s\n", deviceIdx, deviceProp.name);
 
@@ -48,13 +49,16 @@ int main() {
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
     // setup the (global) cuBLASLt workspace
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
+    #ifdef ENABLE_CUDNN
+    checkCudnnErr(cudnnCreate(&cudnn_handle));
+    #endif
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
 
-    int B = 4;
-    int T = 1024;
+    int B = 24; // if program OOMs decrease this number, e.g. all the way down to 4 or etc
+    int T = 1024; // if even that OOMs move on to this one. keep them nice and powers of 2
     printf("batch size: %d\n", B);
     printf("sequence length: %d\n", T);
 
@@ -65,6 +69,7 @@ int main() {
         y[i] = i % model.config.vocab_size;
     }
 
+    // override number of layers to 1 because all layers repeat the same kernels, only profile once
     model.config.num_layers = 1;
 
     // do a training step
@@ -73,8 +78,13 @@ int main() {
     gpt2_backward(&model);
     gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, 1);
     cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
+
     // free
     gpt2_free(&model);
+    #ifdef ENABLE_CUDNN
+    if (cudnn_workspace != NULL) { cudaCheck(cudaFree(cudnn_workspace)); }
+    checkCudnnErr(cudnnDestroy(cudnn_handle));
+    #endif
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));

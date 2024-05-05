@@ -21,11 +21,17 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <string.h>
 #include <unistd.h>
 #include <assert.h>
+// GPU / CUDA related
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+// our own utilities
+// defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
+#include "utils.h"
+// defines: tokenizer_init, tokenizer_decode, tokenizer_free
+#include "tokenizer.h"
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -61,78 +67,6 @@ cublasHandle_t cublas_handle;
 cublasLtHandle_t cublaslt_handle;
 
 namespace cg = cooperative_groups;
-
-// ----------------------------------------------------------------------------
-// fread convenience utils, with nice handling of error checking using macros
-// simple replace fopen, fread, fclose with fopenCheck, freadCheck, fcloseCheck
-
-FILE *fopen_check(const char *path, const char *mode, const char *file, int line) {
-    FILE *fp = fopen(path, mode);
-    if (fp == NULL) {
-        fprintf(stderr, "Error: Failed to open file '%s' at %s:%d\n", path, file, line);
-        fprintf(stderr, "Error details:\n");
-        fprintf(stderr, "  File: %s\n", file);
-        fprintf(stderr, "  Line: %d\n", line);
-        fprintf(stderr, "  Path: %s\n", path);
-        fprintf(stderr, "  Mode: %s\n", mode);
-        exit(EXIT_FAILURE);
-    }
-    return fp;
-}
-
-#define fopenCheck(path, mode) fopen_check(path, mode, __FILE__, __LINE__)
-
-void fread_check(void *ptr, size_t size, size_t nmemb, FILE *stream, const char *file, int line) {
-    size_t result = fread(ptr, size, nmemb, stream);
-    if (result != nmemb) {
-        if (feof(stream)) {
-            fprintf(stderr, "Error: Unexpected end of file at %s:%d\n", file, line);
-        } else if (ferror(stream)) {
-            fprintf(stderr, "Error: File read error at %s:%d\n", file, line);
-        } else {
-            fprintf(stderr, "Error: Partial read at %s:%d. Expected %zu elements, read %zu\n",
-                    file, line, nmemb, result);
-        }
-        fprintf(stderr, "Error details:\n");
-        fprintf(stderr, "  File: %s\n", file);
-        fprintf(stderr, "  Line: %d\n", line);
-        fprintf(stderr, "  Expected elements: %zu\n", nmemb);
-        fprintf(stderr, "  Read elements: %zu\n", result);
-        exit(EXIT_FAILURE);
-    }
-}
-
-#define freadCheck(ptr, size, nmemb, stream) fread_check(ptr, size, nmemb, stream, __FILE__, __LINE__)
-
-void fclose_check(FILE *fp, const char *file, int line) {
-    if (fclose(fp) != 0) {
-        fprintf(stderr, "Error: Failed to close file at %s:%d\n", file, line);
-        fprintf(stderr, "Error details:\n");
-        fprintf(stderr, "  File: %s\n", file);
-        fprintf(stderr, "  Line: %d\n", line);
-        exit(EXIT_FAILURE);
-    }
-}
-
-#define fcloseCheck(fp) fclose_check(fp, __FILE__, __LINE__)
-
-// ----------------------------------------------------------------------------
-// malloc error-handling wrapper util
-
-void *malloc_check(size_t size, const char *file, int line) {
-    void *ptr = malloc(size);
-    if (ptr == NULL) {
-        fprintf(stderr, "Error: Memory allocation failed at %s:%d\n", file, line);
-        fprintf(stderr, "Error details:\n");
-        fprintf(stderr, "  File: %s\n", file);
-        fprintf(stderr, "  Line: %d\n", line);
-        fprintf(stderr, "  Size: %zu bytes\n", size);
-        exit(EXIT_FAILURE);
-    }
-    return ptr;
-}
-
-#define mallocCheck(size) malloc_check(size, __FILE__, __LINE__)
 
 // ----------------------------------------------------------------------------
 // all the kernels
@@ -968,7 +902,6 @@ typedef struct {
 
 void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
     int Vp = config.padded_vocab_size;
-    int V = config.vocab_size;
     int C = config.channels;
     int maxT = config.max_seq_len;
     int L = config.num_layers;
@@ -1549,9 +1482,9 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     loader->tokens_file = fopenCheck(filename, "rb");
 
     // determine the file size
-    fseek(loader->tokens_file, 0, SEEK_END);
+    fseekCheck(loader->tokens_file, 0, SEEK_END);
     loader->file_size = ftell(loader->tokens_file);
-    fseek(loader->tokens_file, 0, SEEK_SET);
+    fseekCheck(loader->tokens_file, 0, SEEK_SET);
     if (loader->file_size < (B * T + 1) * sizeof(int)) {
         printf("Error: file size is too small for the batch size and sequence length\n");
         exit(EXIT_FAILURE);
@@ -1579,7 +1512,7 @@ void dataloader_next_batch(DataLoader *loader) {
         loader->current_position = 0;
     }
     // read the B*T+1 integers from the file into batch
-    fseek(loader->tokens_file, loader->current_position, SEEK_SET);
+    fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
     freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
     // advance the current position by B*T integers
     loader->current_position += B*T * sizeof(int);
@@ -1623,86 +1556,6 @@ int sample_softmax(const float* logits, int n, float coin) {
         }
     }
     return n - 1; // in case of rounding errors
-}
-
-// ----------------------------------------------------------------------------
-// Tokenizer (only supports decoding: tokens (integers) -> strings)
-
-typedef struct {
-    uint32_t vocab_size;
-    char **token_table;
-    int init_ok;
-} Tokenizer;
-
-void safe_printf(const char *piece) {
-    // the tokens are raw bytes, and we we only want to print the printable ones
-    // many bytes can be various control codes, backspace, etc.
-    if (piece == NULL) { return; }
-    if (piece[0] == '\0') { return; }
-    // handle individual byte tokens
-    // every token is asserted to be at least one byte so doing piece[1] is ok
-    if (piece[1] == '\0') {
-        unsigned char byte_val = piece[0];
-        if (!(isprint(byte_val) || isspace(byte_val))) {
-            return; // weird byte, don't print it
-        }
-    }
-    printf("%s", piece);
-}
-
-void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
-    FILE *file = fopen(filename, "rb");
-    if (file == NULL) {
-        // try to be more helpful as we just added this feature, erase later
-        printf("---\n");
-        printf("WARNING: Failed to open the tokenizer file %s\n", filename);
-        printf("The Tokenizer is a new feature added April 14 2024.\n");
-        printf("Re-run `python train_gpt2.py` to write it\n");
-        printf("---\n");
-        tokenizer->init_ok = 0;
-        return;
-    }
-    // read in the header
-    uint32_t header[256];
-    freadCheck(header, sizeof(uint32_t), 256, file);
-    assert(header[0] == 20240328);
-    assert(header[1] == 1);
-    tokenizer->vocab_size = header[2];
-    // read in all the tokens
-    unsigned char length;
-    tokenizer->token_table = (char **)mallocCheck(tokenizer->vocab_size * sizeof(char *));
-    for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-        freadCheck(&length, sizeof(unsigned char), 1, file);
-        assert(length > 0); // every token should be at least one character
-        char *token_bytes = (char *)mallocCheck(length + 1);
-        freadCheck(token_bytes, sizeof(char), length, file);
-        token_bytes[length] = '\0';  // Add null terminator for printing
-        tokenizer->token_table[i] = token_bytes;
-    }
-    // cleanups
-    fcloseCheck(file);
-    tokenizer->init_ok = 1;
-}
-
-const char *tokenizer_decode(Tokenizer *tokenizer, uint32_t token_id) {
-    if (tokenizer->init_ok == 0) {
-        return NULL;
-    }
-    if (token_id < tokenizer->vocab_size) {
-        return tokenizer->token_table[token_id];
-    } else {
-        printf("invalid token id %d!\n", token_id);
-        return NULL;
-    }
-}
-
-void tokenizer_free(Tokenizer *tokenizer) {
-    if (tokenizer->init_ok) {
-        for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-            free(tokenizer->token_table[i]);
-        }
-        free(tokenizer->token_table);
-    }
 }
 
 // ----------------------------------------------------------------------------
