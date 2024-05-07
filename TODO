@@ -1,7 +1,18 @@
 - Training SAE -
-* implement backwards pass
-* perf test different kernels
-* explore cutting forward pass short in GPT
+* perf test different kernels and compare to transformer lens
+
+- llm.c support
+* add shared activations queue for SAE trainer to read from
+* cut short forward pass
+* looping inference support
+
+- llama.cpp support
+* expose activations by pushing to activations queue when node finishes
+* look into building smaller compute graph based to cut short forward pass
+* looping inference support
+
+- User Interface
+* allow use to select layer to learn features from
 
 - Feature Exploration -
 * serve over web server
